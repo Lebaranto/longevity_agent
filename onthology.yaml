@@ -1,0 +1,216 @@
+species:
+  - id: mouse
+    name: Mus musculus
+  - id: human
+    name: Homo sapiens
+  - id: fly
+    name: Drosophila melanogaster
+  - id: worm
+    name: Caenorhabditis elegans
+
+pathways:
+  - id: mtor
+    name: "mTOR signaling"
+    conserved_human_mouse: true
+    hallmarks:
+      - deregulated_nutrient_sensing
+      - loss_of_proteostasis
+
+  - id: ampk
+    name: "AMPK signaling"
+    conserved_human_mouse: true
+    hallmarks:
+      - deregulated_nutrient_sensing
+      - altered_intercellular_communication
+
+  - id: insulin_igf1
+    name: "Insulin/IGF-1 signaling"
+    conserved_human_mouse: true
+    hallmarks:
+      - deregulated_nutrient_sensing
+
+  - id: sirtuins
+    name: "Sirtuin-mediated signaling"
+    conserved_human_mouse: true
+    hallmarks:
+      - epigenetic_alterations
+      - mitochondrial_dysfunction
+
+  - id: senescence
+    name: "Cellular senescence"
+    conserved_human_mouse: true
+    hallmarks:
+      - cellular_senescence
+      - altered_intercellular_communication
+
+  - id: nad_metabolism
+    name: "NAD+ metabolism"
+    conserved_human_mouse: true
+    hallmarks:
+      - mitochondrial_dysfunction
+      - loss_of_proteostasis
+
+  - id: autophagy
+    name: "Autophagy / lysosomal pathway"
+    conserved_human_mouse: true
+    hallmarks:
+      - loss_of_proteostasis
+      - cellular_senescence
+
+genes:
+  - id: MTOR
+    species: ["mouse", "human"]
+    pathways: ["mtor", "autophagy"]
+    longevity_evidence:
+      human: "candidate"
+      mouse: "strong"
+
+  - id: AMPKA1
+    species: ["mouse", "human"]
+    pathways: ["ampk"]
+    longevity_evidence:
+      human: "candidate"
+      mouse: "medium"
+
+  - id: SIRT1
+    species: ["mouse", "human"]
+    pathways: ["sirtuins", "ampk"]
+    longevity_evidence:
+      human: "candidate"
+      mouse: "strong"
+
+  - id: IGF1
+    species: ["mouse", "human"]
+    pathways: ["insulin_igf1"]
+    longevity_evidence:
+      human: "mixed"
+      mouse: "strong"
+
+  - id: FOXO3
+    species: ["mouse", "human"]
+    pathways: ["insulin_igf1"]
+    longevity_evidence:
+      human: "strong"
+      mouse: "strong"
+
+  - id: CDKN2A
+    species: ["mouse", "human"]
+    pathways: ["senescence"]
+    longevity_evidence:
+      human: "candidate"
+      mouse: "medium"
+
+  - id: NAMPT
+    species: ["mouse", "human"]
+    pathways: ["nad_metabolism"]
+    longevity_evidence:
+      human: "candidate"
+      mouse: "medium"
+
+interventions:
+  - id: rapamycin
+    name: Rapamycin
+    type: drug
+    targets: ["MTOR"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 23
+        evidence_level: strong
+      - species: fly
+        lifespan_change_pct: 15
+        evidence_level: medium
+
+  - id: metformin
+    name: Metformin
+    type: drug
+    targets: ["AMPKA1"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 7
+        evidence_level: mixed
+      - species: worm
+        lifespan_change_pct: 20
+        evidence_level: strong
+
+  - id: resveratrol
+    name: Resveratrol
+    type: compound
+    targets: ["SIRT1", "AMPKA1"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 5
+        evidence_level: mixed
+      - species: worm
+        lifespan_change_pct: 15
+        evidence_level: medium
+
+  - id: acarbose
+    name: Acarbose
+    type: drug
+    targets: ["IGF1"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 22
+        evidence_level: strong
+
+  - id: dasatinib_quercetin
+    name: "Dasatinib + Quercetin (senolytics)"
+    type: drug_combo
+    targets: ["CDKN2A"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 10
+        evidence_level: medium
+
+  - id: fisetin
+    name: Fisetin
+    type: compound
+    targets: ["CDKN2A"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 7
+        evidence_level: weak
+
+  - id: nr
+    name: "Nicotinamide riboside"
+    type: supplement
+    targets: ["NAMPT", "SIRT1"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 5
+        evidence_level: mixed
+
+  - id: caloric_restriction
+    name: "Caloric restriction"
+    type: diet
+    targets: ["AMPKA1", "SIRT1", "MTOR"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 30
+        evidence_level: strong
+      - species: worm
+        lifespan_change_pct: 40
+        evidence_level: strong
+      - species: fly
+        lifespan_change_pct: 30
+        evidence_level: strong
+
+  - id: igf1r_knockdown
+    name: "IGF-1/IGF1R signaling reduction"
+    type: genetic
+    targets: ["IGF1", "FOXO3"]
+    effects:
+      - species: mouse
+        lifespan_change_pct: 18
+        evidence_level: strong
+      - species: worm
+        lifespan_change_pct: 45
+        evidence_level: strong
+
+rules:
+  translation_scoring:
+    base: 0
+    multi_species_bonus: 2
+    conserved_pathway_bonus: 2
+    human_longevity_gene_bonus: 2
+    weak_evidence_penalty: -1
