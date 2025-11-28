@@ -1,59 +1,55 @@
 from __future__ import annotations
 
-from typing import TypedDict, List, Optional, Dict, Any, Annotated, Literal
-from typing_extensions import NotRequired
-import operator
-import json
+from functools import partial
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
-from langgraph.graph import StateGraph, END, MessagesState
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import END, MessagesState, StateGraph
 from pydantic import BaseModel, Field
+from typing_extensions import NotRequired
 
 from dotenv import load_dotenv
-load_dotenv()
 
 from world_model import WorldModel
 
+load_dotenv()
 
-# ============ STATE SCHEMA ============
+
+# ================= STATE DEFINITION =================
+
 
 class AgentState(MessagesState):
-    """Состояние агентной системы"""
-    # Пользовательский ввод
+    """State passed between LangGraph nodes."""
+
     user_query: str
-
-    # Распознанное намерение
-    intent: NotRequired[str]  # "analyze_intervention", "compare", "search", "general_question"
-    extracted_entities: NotRequired[Dict[str, Any]]  # intervention_names, species, etc
-
-    # Данные из World Model
+    intent: NotRequired[str]
+    extracted_entities: NotRequired[Dict[str, Any]]
     world_model_data: NotRequired[Dict[str, Any]]
-
-    # Результаты анализа
+    micro_reasoning: NotRequired[List[str]]
     translation_analysis: NotRequired[Dict[str, Any]]
     experiment_plan: NotRequired[List[Dict[str, Any]]]
-
-    # Финальный отчет
     final_report: NotRequired[str]
-
-    # Служебная информация
     errors: NotRequired[List[str]]
     next_step: NotRequired[str]
 
 
-# ============ STRUCTURED OUTPUT SCHEMAS ============
+# ================= STRUCTURED OUTPUT SCHEMAS =================
+
 
 class ExtractedEntities(BaseModel):
-    """Извлеченные из запроса сущности"""
-    intervention_names: List[str] = Field(description="Названия интервенций")
-    species_mentioned: List[str] = Field(default_factory=list, description="Упомянутые виды")
-    comparison_request: bool = Field(default=False, description="Запрос на сравнение")
-    question_type: str = Field(description="Тип вопроса: analyze, compare, search, general")
+    """Entities extracted from the incoming query."""
+
+    intervention_names: List[str] = Field(description="Explicitly named interventions")
+    species_mentioned: List[str] = Field(default_factory=list, description="Species mentioned in the prompt")
+    comparison_request: bool = Field(default=False, description="Whether the user is comparing interventions")
+    question_type: str = Field(description="analyze, compare, search, general")
+    is_relevant: bool = Field(description="True if the query relates to longevity or aging science")
 
 
 class TranslationAnalysis(BaseModel):
-    """Результат анализа трансляционного потенциала"""
+    """Result of the translation potential analysis."""
+
     intervention_id: str
     human_relevance_score: float = Field(ge=0, le=100)
     confidence: str = Field(description="high/medium/low")
@@ -64,7 +60,8 @@ class TranslationAnalysis(BaseModel):
 
 
 class ExperimentProposal(BaseModel):
-    """Предложение эксперимента"""
+    """Experiment planning suggestion."""
+
     priority: int = Field(ge=1, le=3, description="1=highest, 3=lowest")
     experiment_type: str
     design_summary: str
@@ -75,134 +72,98 @@ class ExperimentProposal(BaseModel):
 
 
 class PlannerResponse(BaseModel):
-    """Ответ планировщика: список экспериментов"""
+    """List of experiments to run next."""
+
     experiments: List[ExperimentProposal]
 
 
-# ============ ПРОМПТЫ ============
+# ================= PROMPTS =================
 
-INTENT_EXTRACTION_PROMPT = """Ты — эксперт по обработке запросов о longevity-интервенциях.
 
-Пользовательский запрос:
+INTENT_EXTRACTION_PROMPT = """You are a guardrail and intent extractor for a longevity research agent.
+
+User query:
 {user_query}
 
-Проанализируй запрос и извлеки:
-1. Названия упомянутых интервенций (rapamycin, metformin, caloric restriction и т.д.)
-2. Упомянутые виды (mouse, human, fly, worm)
-3. Является ли это запросом на сравнение нескольких интервенций
-4. Тип вопроса:
-   - "analyze" - детальный анализ одной/нескольких интервенций
-   - "compare" - сравнение интервенций
-   - "search" - поиск информации
-   - "general" - общий вопрос о longevity
+Decide whether the query is relevant to longevity, aging biology, translational research, or experiment design. If it is off-topic (travel, math homework, personal advice, etc.), mark is_relevant as false.
 
-Ответь в формате JSON со следующими полями:
-- intervention_names: список строк
-- species_mentioned: список строк
-- comparison_request: bool
-- question_type: str
+Extract:
+1. intervention_names: concrete interventions (rapamycin, metformin, caloric restriction, etc.)
+2. species_mentioned: explicit species names
+3. comparison_request: true/false
+4. question_type: one of analyze, compare, search, general
+5. is_relevant: true if longevity/aging related, else false
 
-Если интервенция упомянута в общей форме (например, "сенолитики"), укажи конкретные примеры из известных тебе."""
+Respond strictly as JSON with keys: intervention_names, species_mentioned, comparison_request, question_type, is_relevant."""
 
-TRANSLATOR_AGENT_PROMPT = """Ты — эксперт по кросс-видовой трансляции результатов longevity-исследований.
 
-# КОНТЕКСТ
-Интервенция: {intervention_name}
-Базовый score из формальных правил: {formal_score}
+MICRO_REASONING_PROMPT = """You are a concise micro-reasoning layer for a longevity translation agent.
+Intervention: {name}
+World model formal score: {score}
+World model warnings: {warnings}
+Targets: {targets}
+Cross-species effects: {effects}
 
-# ДАННЫЕ ИЗ WORLD MODEL
-Таргеты: {targets}
-Эффекты по видам: {effects}
-Задействованные пути: {pathways}
+Produce 3 short bullet points (<=40 words each) that link the formal score to practical intuition and identify one potential hidden risk or confounder. Keep it compact."""
+
+
+TRANSLATOR_AGENT_PROMPT = """You are an expert in cross-species translation for longevity interventions.
+
+# CONTEXT
+Intervention: {intervention_name}
+Formal score from knowledge graph rules: {formal_score}
+Targets: {targets}
+Effects by species:
+{effects}
+Pathways involved:
+{pathways}
 Human longevity evidence: {human_evidence}
-
-# ШАГИ ФОРМАЛЬНОГО ВЫВОДА
+Reasoning trace from scoring rules:
 {reasoning_steps}
-
-# ПРЕДУПРЕЖДЕНИЯ
+Micro reasoning hints:
+{micro_reasoning}
+Warnings:
 {warnings}
 
-# ТВОЯ ЗАДАЧА
-Проведи глубокий анализ трансляционного потенциала этой интервенции для человека.
+# TASK
+Provide a JSON object with:
+- intervention_id
+- human_relevance_score (0-100)
+- confidence (high/medium/low)
+- key_strengths (2-4 items)
+- key_concerns (2-4 items)
+- mechanistic_reasoning (2-3 sentences)
+- bottom_line (1-2 sentences)
+"""
 
-1. **Human Relevance Score (0-100)**: Оцени вероятность успешной трансляции с учетом:
-   - Филогенетическое расстояние протестированных видов
-   - Консервативность молекулярных механизмов
-   - Наличие human longevity evidence
-   - Качество экспериментальных данных
-   - Формальный score: {formal_score}
 
-2. **Confidence** (high/medium/low): Уверенность в оценке
+PLANNER_AGENT_PROMPT = """You are an experiment planner for validating longevity interventions.
 
-3. **Key Strengths** (2-4 пункта): Главные сильные стороны интервенции
-
-4. **Key Concerns** (2-4 пункта): Основные риски и ограничения
-
-5. **Mechanistic Reasoning**: Почему механизм действия может/не может работать у человека (2-3 предложения)
-
-6. **Bottom Line**: Краткая рекомендация (1-2 предложения)
-
-Ответь в формате JSON с полями:
-- intervention_id: str
-- human_relevance_score: float (0-100)
-- confidence: str
-- key_strengths: List[str]
-- key_concerns: List[str]
-- mechanistic_reasoning: str
-- bottom_line: str"""
-
-PLANNER_AGENT_PROMPT = """Ты — планировщик экспериментов для валидации longevity-интервенций.
-
-# КОНТЕКСТ
-Интервенция: {intervention_name}
+# CONTEXT
+Intervention: {intervention_name}
 Human Relevance Score: {hrs}
 Confidence: {confidence}
 
-# ТЕКУЩИЕ ДАННЫЕ
+# CURRENT DATA
 {current_data}
 
-# ВЫЯВЛЕННЫЕ ПРОБЕЛЫ
+# IDENTIFIED GAPS
 {identified_gaps}
 
-# ДОСТУПНЫЕ ТИПЫ ЭКСПЕРИМЕНТОВ
-1. **In vitro (человеческие клетки)** - стоимость: $10-50k, время: 2-4 мес
-   Подходит для: проверки механизма на человеческих клеточных линиях
+# AVAILABLE EXPERIMENT TYPES
+1. In vitro (human cells) — $10-50k, 2-4 months
+2. Ex vivo (organoids) — $50-150k, 4-6 months
+3. Additional model organisms — $30-100k, 6-12 months
+4. Non-human primates — $500k-2M, 24-60 months
+5. Epidemiology — $20-80k, 3-6 months
+6. Retrospective clinical data — $15-50k, 2-4 months
 
-2. **Ex vivo (органоиды)** - стоимость: $50-150k, время: 4-6 мес
-   Подходит для: тестирования на сложных тканевых моделях
+Budget limit: $200k. Time limit: 12 months.
 
-3. **Дополнительные модельные организмы** - стоимость: $30-100k, время: 6-12 мес
-   Подходит для: заполнения филогенетических пробелов
-
-4. **Non-human primates** - стоимость: $500k-2M, время: 2-5 лет
-   Подходит для: финальной валидации перед клиникой
-
-5. **Эпидемиологический анализ** - стоимость: $20-80k, время: 3-6 мес
-   Подходит для: поиска корреляций в человеческих популяциях
-
-6. **Ретроспективный анализ клинических данных** - стоимость: $15-50k, время: 2-4 мес
-   Подходит для: одобренных препаратов с историей применения
-
-# ТВОЯ ЗАДАЧА
-Предложи 2-3 эксперимента, которые максимально уменьшат неопределенность и риски.
-
-ОГРАНИЧЕНИЯ:
-- Бюджет: $200k
-- Время: 12 месяцев
-
-Для каждого эксперимента укажи:
-- priority: 1 (highest), 2 (medium), 3 (lowest)
-- experiment_type: тип из списка выше
-- design_summary: краткое описание дизайна (2-3 предложения)
-- addresses_gap: какой пробел в знаниях закрывает
-- expected_uncertainty_reduction: снижение неопределенности в % (0-100)
-- estimated_cost: диапазон ($)
-- estimated_duration: время в месяцах
-
-Ответь в формате JSON с ОБЪЕКТОМ следующей структуры (СТРОГО В JSON, НИКАК ИНАЧЕ):
-{
+Return JSON with structure:
+{{
   "experiments": [
-    {
+    {{
       "priority": ...,
       "experiment_type": "...",
       "design_summary": "...",
@@ -210,360 +171,360 @@ Confidence: {confidence}
       "expected_uncertainty_reduction": ...,
       "estimated_cost": "...",
       "estimated_duration": "..."
-    },
-    ...
+    }}
   ]
-}
-
-ВАЖНО: Учитывай текущий уровень confidence и HRS при планировании:
-- Если confidence=low → начни с базовых экспериментов (in vitro)
-- Если confidence=high и HRS>70 → можно сразу к приматам/клинике
-- Если есть одобренный препарат → приоритет на эпидемиологию"""
+}}
+"""
 
 
-# ============ АГЕНТНАЯ СИСТЕМА ============
+# ================= NODE IMPLEMENTATIONS =================
 
-class LongevityAgentSystem:
-    def __init__(
-        self,
-        world_model_path: str,
-        llm_model: str = "gpt-5-mini",
-        temperature: float = 0.0
-    ):
-        self.world_model = WorldModel(world_model_path)
-        self.llm = ChatOpenAI(model=llm_model, temperature=temperature)
 
-        self.workflow = self._build_workflow()
-        self.app = self.workflow.compile()
+def _extract_intent_node(state: AgentState, *, llm: ChatOpenAI) -> AgentState:
+    query = state["user_query"]
+    prompt = INTENT_EXTRACTION_PROMPT.format(user_query=query)
 
-    def _build_workflow(self) -> StateGraph:
-        """Строит LangGraph workflow"""
-        workflow = StateGraph(AgentState)
+    try:
+        llm_with_structure = llm.with_structured_output(ExtractedEntities)
+        result = llm_with_structure.invoke(prompt)
 
-        # Узлы
-        workflow.add_node("extract_intent", self._extract_intent_node)
-        workflow.add_node("query_world_model", self._query_world_model_node)
-        workflow.add_node("translator_agent", self._translator_agent_node)
-        workflow.add_node("planner_agent", self._planner_agent_node)
-        workflow.add_node("generate_report", self._generate_report_node)
+        state["intent"] = result.question_type
+        state["extracted_entities"] = {
+            "intervention_names": result.intervention_names,
+            "species_mentioned": result.species_mentioned,
+            "comparison_request": result.comparison_request,
+            "is_relevant": result.is_relevant,
+        }
 
-        # Граф выполнения
-        workflow.set_entry_point("extract_intent")
+        state["messages"] = [f"Intent: {result.question_type}"]
+    except Exception as exc:  # pragma: no cover - defensive
+        state["errors"] = [f"Intent extraction failed: {exc}"]
+        state["next_step"] = "end"
 
-        # Условная маршрутизация после извлечения намерений
-        workflow.add_conditional_edges(
-            "extract_intent",
-            self._route_after_intent,
-            {
-                "query_wm": "query_world_model",
-                "end": END,
-            }
+    return state
+
+
+def _route_after_intent(state: AgentState) -> str:
+    if state.get("errors"):
+        return "end"
+
+    entities = state.get("extracted_entities", {})
+
+    if not entities.get("is_relevant", True):
+        state["final_report"] = (
+            "The request does not look related to longevity or aging. "
+            "Please rephrase with a concrete intervention or aging topic, or ask to terminate."
         )
+        return "end"
 
-        workflow.add_edge("query_world_model", "translator_agent")
-        workflow.add_edge("translator_agent", "planner_agent")
-        workflow.add_edge("planner_agent", "generate_report")
-        workflow.add_edge("generate_report", END)
+    if not entities.get("intervention_names"):
+        state["final_report"] = (
+            "I could not find specific interventions to analyze. "
+            "Please name at least one intervention (e.g., rapamycin, metformin, caloric restriction)."
+        )
+        return "end"
 
-        return workflow
+    return "query_wm"
 
-    # ============ УЗЛЫ ГРАФА ============
 
-    def _extract_intent_node(self, state: AgentState) -> AgentState:
-        """Узел 1: Извлечение намерений и сущностей"""
-        query = state["user_query"]
+def _query_world_model_node(state: AgentState, *, world_model: WorldModel) -> AgentState:
+    entities = state["extracted_entities"]
+    intervention_names = entities["intervention_names"]
 
-        prompt = INTENT_EXTRACTION_PROMPT.format(user_query=query)
+    wm_data = []
 
-        try:
-            llm_with_structure = self.llm.with_structured_output(ExtractedEntities)
-            result = llm_with_structure.invoke(prompt)
+    for name in intervention_names:
+        iv = world_model.find_intervention_by_name(name)
 
-            state["intent"] = result.question_type
-            state["extracted_entities"] = {
-                "intervention_names": result.intervention_names,
-                "species_mentioned": result.species_mentioned,
-                "comparison_request": result.comparison_request,
-            }
+        if iv is None:
+            state["messages"] = [f"Intervention '{name}' is not in the knowledge base."]
+            continue
 
-            state["messages"] = [
-                f"✓ Intent: {result.question_type}",
-                f"✓ Извлечено интервенций: {len(result.intervention_names)}",
-            ]
+        score_result = world_model.compute_translation_score(iv.id)
 
-        except Exception as e:
-            state["errors"] = [f"Ошибка извлечения намерений: {str(e)}"]
-            state["next_step"] = "end"
-
-        return state
-
-    def _route_after_intent(self, state: AgentState) -> str:
-        """Маршрутизация после извлечения намерений"""
-        if state.get("errors"):
-            return "end"
-
-        entities = state.get("extracted_entities", {})
-        if not entities.get("intervention_names"):
-            state["final_report"] = (
-                "Не удалось определить конкретные интервенции для анализа. "
-                "Пожалуйста, уточните запрос, упомянув название интервенции "
-                "(например: rapamycin, metformin, caloric restriction)."
-            )
-            return "end"
-
-        return "query_wm"
-
-    def _query_world_model_node(self, state: AgentState) -> AgentState:
-        """Узел 2: Запрос к World Model"""
-        entities = state["extracted_entities"]
-        intervention_names = entities["intervention_names"]
-
-        wm_data = []
-
-        for name in intervention_names:
-            iv = self.world_model.find_intervention_by_name(name)
-
-            if iv is None:
-                # возвращаем только новое сообщение — остальное склеит MessagesState
-                state["messages"] = [
-                    f"⚠ Интервенция '{name}' не найдена в базе знаний"
-                ]
-                continue
-
-            score_result = self.world_model.compute_translation_score(iv.id)
-
-            pathways_info = []
-            for target_id in iv.targets:
-                gene = self.world_model.genes.get(target_id)
-                if gene:
-                    for pw_id in gene.pathways:
-                        pw = self.world_model.pathways.get(pw_id)
-                        if pw:
-                            pathways_info.append({
+        pathways_info = []
+        for target_id in iv.targets:
+            gene = world_model.genes.get(target_id)
+            if gene:
+                for pw_id in gene.pathways:
+                    pw = world_model.pathways.get(pw_id)
+                    if pw:
+                        pathways_info.append(
+                            {
                                 "id": pw.id,
                                 "name": pw.name,
                                 "conserved": pw.conserved_human_mouse,
-                                "hallmarks": pw.hallmarks
-                            })
+                                "hallmarks": pw.hallmarks,
+                            }
+                        )
 
-            human_evidence = []
-            for target_id in iv.targets:
-                gene = self.world_model.genes.get(target_id)
-                if gene:
-                    ev = gene.longevity_evidence.get("human", "none")
-                    human_evidence.append(f"{target_id}: {ev}")
+        human_evidence = []
+        for target_id in iv.targets:
+            gene = world_model.genes.get(target_id)
+            if gene:
+                ev = gene.longevity_evidence.get("human", "none")
+                human_evidence.append(f"{target_id}: {ev}")
 
-            wm_data.append({
+        wm_data.append(
+            {
                 "intervention": {
                     "id": iv.id,
                     "name": iv.name,
                     "type": iv.type,
                     "targets": iv.targets,
-                    "effects": [e.model_dump() for e in iv.effects],
+                    "effects": [effect.model_dump() for effect in iv.effects],
                 },
                 "formal_score": score_result["score"],
                 "reasoning_steps": score_result["steps"],
                 "warnings": score_result["warnings"],
                 "pathways": pathways_info,
                 "human_evidence": human_evidence,
-            })
+            }
+        )
 
-        state["world_model_data"] = {"interventions": wm_data}
-        state["messages"] = [
-            f"✓ Загружено данных для {len(wm_data)} интервенций"
-        ]
+    state["world_model_data"] = {"interventions": wm_data}
+    state["messages"] = [f"Loaded {len(wm_data)} interventions from the knowledge graph."]
+    return state
 
-        return state
 
-    def _translator_agent_node(self, state: AgentState) -> AgentState:
-        """Узел 3: Анализ трансляционного потенциала"""
-        wm_data = state["world_model_data"]["interventions"]
+def _micro_reasoning_node(state: AgentState, *, llm: ChatOpenAI) -> AgentState:
+    wm_interventions = state.get("world_model_data", {}).get("interventions", [])
+    mini_insights: List[str] = []
 
-        analyses = []
+    for iv_data in wm_interventions:
+        iv = iv_data["intervention"]
+        prompt = MICRO_REASONING_PROMPT.format(
+            name=iv["name"],
+            score=iv_data.get("formal_score", 0),
+            warnings=", ".join(iv_data.get("warnings", [])) or "none",
+            targets=", ".join(iv.get("targets", [])),
+            effects=", ".join(
+                f"{eff['species']}: {eff['lifespan_change_pct']}% ({eff['evidence_level']})"
+                for eff in iv.get("effects", [])
+            ),
+        )
 
-        for iv_data in wm_data:
-            iv = iv_data["intervention"]
+        try:
+            response = llm.invoke([SystemMessage(content=prompt)])
+            mini_insights.append(response.content.strip())
+        except Exception as exc:  # pragma: no cover - defensive
+            mini_insights.append(f"Micro reasoning failed for {iv['name']}: {exc}")
 
-            effects_str = "\n".join([
-                f"  - {e['species']}: {e['lifespan_change_pct']}% ({e['evidence_level']})"
-                for e in iv["effects"]
-            ])
+    state["micro_reasoning"] = mini_insights
+    return state
 
-            pathways_str = "\n".join([
-                f"  - {p['name']} (консервативен: {p['conserved']})"
-                for p in iv_data["pathways"]
-            ])
 
-            steps_str = "\n".join([
-                f"  - {s['rule_name']}: {s['explanation']} (Δ={s['delta']})"
-                for s in iv_data["reasoning_steps"]
-            ])
+def _translator_agent_node(state: AgentState, *, llm: ChatOpenAI) -> AgentState:
+    wm_data = state["world_model_data"]["interventions"]
+    micro_reasoning = state.get("micro_reasoning", [])
 
-            warnings_str = "\n".join([f"  - {w}" for w in iv_data["warnings"]]) or "Нет предупреждений"
+    analyses = []
 
-            prompt = TRANSLATOR_AGENT_PROMPT.format(
-                intervention_name=iv["name"],
-                formal_score=iv_data["formal_score"],
-                targets=", ".join(iv["targets"]),
-                effects=effects_str,
-                pathways=pathways_str,
-                human_evidence=", ".join(iv_data["human_evidence"]),
-                reasoning_steps=steps_str,
-                warnings=warnings_str,
-            )
+    for idx, iv_data in enumerate(wm_data):
+        iv = iv_data["intervention"]
 
-            try:
-                llm_with_structure = self.llm.with_structured_output(TranslationAnalysis)
-                analysis = llm_with_structure.invoke(prompt)
-                if not analysis.intervention_id:
-                    analysis.intervention_id = iv["id"]
-                analyses.append(analysis.model_dump())
-            except Exception as e:
-                state["errors"] = state.get("errors", []) + [
-                    f"Ошибка анализа {iv['name']}: {str(e)}"
-                ]
+        effects_str = "\n".join(
+            f"  - {effect['species']}: {effect['lifespan_change_pct']}% ({effect['evidence_level']})"
+            for effect in iv["effects"]
+        )
 
-        state["translation_analysis"] = {"analyses": analyses}
-        state["messages"] = [
-            f"✓ Проведен анализ для {len(analyses)} интервенций"
-        ]
+        pathways_str = "\n".join(
+            f"  - {path['name']} (conserved: {path['conserved']})"
+            for path in iv_data["pathways"]
+        )
 
-        return state
+        steps_str = "\n".join(
+            f"  - {step['rule_name']}: {step['explanation']} (Δ={step['delta']})"
+            for step in iv_data["reasoning_steps"]
+        )
 
-    def _planner_agent_node(self, state: AgentState) -> AgentState:
-        """Узел 4: Планирование экспериментов"""
-        wm_data = state["world_model_data"]["interventions"]
-        analyses = state["translation_analysis"]["analyses"]
+        micro_hint = micro_reasoning[idx] if idx < len(micro_reasoning) else ""
+        warnings_str = "\n".join(f"  - {warn}" for warn in iv_data["warnings"]) or "None"
 
-        all_plans = []
+        prompt = TRANSLATOR_AGENT_PROMPT.format(
+            intervention_name=iv["name"],
+            formal_score=iv_data["formal_score"],
+            targets=", ".join(iv["targets"]),
+            effects=effects_str,
+            pathways=pathways_str,
+            human_evidence=", ".join(iv_data["human_evidence"]),
+            reasoning_steps=steps_str,
+            micro_reasoning=micro_hint,
+            warnings=warnings_str,
+        )
 
-        for iv_data, analysis in zip(wm_data, analyses):
-            iv = iv_data["intervention"]
+        try:
+            llm_with_structure = llm.with_structured_output(TranslationAnalysis)
+            analysis = llm_with_structure.invoke(prompt)
+            if not analysis.intervention_id:
+                analysis.intervention_id = iv["id"]
+            analyses.append(analysis.model_dump())
+        except Exception as exc:  # pragma: no cover - defensive
+            state["errors"] = state.get("errors", []) + [f"Translation analysis failed for {iv['name']}: {exc}"]
 
-            gaps = []
+    state["translation_analysis"] = {"analyses": analyses}
+    state["messages"] = [f"Generated translation analysis for {len(analyses)} interventions."]
+    return state
 
-            species_tested = {e["species"] for e in iv["effects"]}
-            if "mouse" not in species_tested:
-                gaps.append("Отсутствуют данные по мышам (ближайший к человеку протестированный вид)")
 
-            if species_tested.issubset({"fly", "worm"}):
-                gaps.append("Данные только по беспозвоночным - нужна валидация на млекопитающих")
+def _planner_agent_node(state: AgentState, *, llm: ChatOpenAI) -> AgentState:
+    wm_data = state["world_model_data"]["interventions"]
+    analyses = state["translation_analysis"]["analyses"]
 
-            weak_evidence = any(e["evidence_level"] in {"weak", "mixed"} for e in iv["effects"])
-            if weak_evidence:
-                gaps.append("Гетерогенный или слабый evidence - требуется репликация")
+    all_plans = []
 
-            if not any("strong" in ev or "candidate" in ev for ev in iv_data["human_evidence"]):
-                gaps.append("Отсутствие прямых данных по человеческим генам долголетия")
+    for iv_data, analysis in zip(wm_data, analyses):
+        iv = iv_data["intervention"]
 
-            current_data_str = f"Виды: {', '.join(species_tested)}\nЭффекты: {iv['effects']}"
-            gaps_str = "\n".join([f"  - {g}" for g in gaps]) or "Пробелов не выявлено"
+        gaps = []
 
-            prompt = PLANNER_AGENT_PROMPT.format(
-                intervention_name=iv["name"],
-                hrs=analysis["human_relevance_score"],
-                confidence=analysis["confidence"],
-                current_data=current_data_str,
-                identified_gaps=gaps_str,
-            )
+        species_tested = {effect["species"] for effect in iv["effects"]}
+        if "mouse" not in species_tested:
+            gaps.append("Missing mouse data as the closest tested mammal.")
 
-            try:
-                llm_with_structure = self.llm.with_structured_output(PlannerResponse)
-                resp: PlannerResponse = llm_with_structure.invoke(prompt)
+        if species_tested.issubset({"fly", "worm"}):
+            gaps.append("Only invertebrate evidence is available; mammalian validation is needed.")
 
-                all_plans.append({
+        weak_evidence = any(effect["evidence_level"] in {"weak", "mixed"} for effect in iv["effects"])
+        if weak_evidence:
+            gaps.append("Evidence quality is weak or mixed; replication is required.")
+
+        has_human = any("strong" in ev.lower() or "candidate" in ev.lower() for ev in iv_data["human_evidence"])
+        if not has_human:
+            gaps.append("No direct human longevity evidence for the targets.")
+
+        current_data_str = f"Species tested: {', '.join(species_tested)}\nEffects: {iv['effects']}"
+        gaps_str = "\n".join(f"  - {gap}" for gap in gaps) or "No critical gaps detected."
+
+        prompt = PLANNER_AGENT_PROMPT.format(
+            intervention_name=iv["name"],
+            hrs=analysis["human_relevance_score"],
+            confidence=analysis["confidence"],
+            current_data=current_data_str,
+            identified_gaps=gaps_str,
+        )
+
+        try:
+            llm_with_structure = llm.with_structured_output(PlannerResponse)
+            resp: PlannerResponse = llm_with_structure.invoke(prompt)
+
+            all_plans.append(
+                {
                     "intervention_id": iv["id"],
                     "intervention_name": iv["name"],
-                    "experiments": [e.model_dump() for e in resp.experiments]
-                })
-            except Exception as e:
-                state["errors"] = state.get("errors", []) + [
-                    f"Ошибка планирования для {iv['name']}: {str(e)}"
-                ]
+                    "experiments": [exp.model_dump() for exp in resp.experiments],
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            state["errors"] = state.get("errors", []) + [f"Planning failed for {iv['name']}: {exc}"]
 
-        state["experiment_plan"] = all_plans
-        state["messages"] = [
-            "✓ Сгенерированы планы экспериментов"
-        ]
+    state["experiment_plan"] = all_plans
+    state["messages"] = ["Generated experiment plans."]
+    return state
 
-        return state
 
-    def _generate_report_node(self, state: AgentState) -> AgentState:
-        """Узел 5: Генерация финального отчета"""
-        wm_data = state["world_model_data"]["interventions"]
-        analyses = state["translation_analysis"]["analyses"]
-        plans = state.get("experiment_plan", [])
+def _generate_report_node(state: AgentState) -> AgentState:
+    wm_data = state["world_model_data"].get("interventions", [])
+    analyses = state["translation_analysis"].get("analyses", [])
+    plans = state.get("experiment_plan", [])
 
-        report_sections: List[str] = []
+    report_sections: List[str] = []
 
-        report_sections.append("# ОТЧЕТ: АНАЛИЗ LONGEVITY-ИНТЕРВЕНЦИЙ\n")
-        report_sections.append(f"Запрос: {state['user_query']}\n")
-        report_sections.append("=" * 80 + "\n")
+    report_sections.append("# Longevity Intervention Report\n")
+    report_sections.append(f"Query: {state['user_query']}\n")
+    report_sections.append("=" * 80 + "\n")
 
-        if not wm_data or not analyses:
-            report_sections.append("\nНе удалось построить детальный отчет — нет данных по интервенциям.\n")
-        else:
-            for iv_data, analysis, plan in zip(wm_data, analyses, plans):
-                iv = iv_data["intervention"]
+    if not wm_data or not analyses:
+        report_sections.append("No detailed report available — missing intervention data.\n")
+    else:
+        for iv_data, analysis, plan in zip(wm_data, analyses, plans):
+            iv = iv_data["intervention"]
 
-                report_sections.append(f"\n## ИНТЕРВЕНЦИЯ: {iv['name'].upper()}\n")
-                report_sections.append(f"Тип: {iv['type']}\n")
-                report_sections.append(f"Таргеты: {', '.join(iv['targets'])}\n")
+            report_sections.append(f"\n## Intervention: {iv['name']}\n")
+            report_sections.append(f"Type: {iv['type']}\n")
+            report_sections.append(f"Targets: {', '.join(iv['targets'])}\n")
 
+            report_sections.append(
+                f"\n### Human Relevance Score: {analysis['human_relevance_score']:.1f}/100"
+            )
+            report_sections.append(f"Confidence: {analysis['confidence']}\n")
+
+            report_sections.append(f"\n**Bottom Line:** {analysis['bottom_line']}\n")
+
+            report_sections.append("\n**Key strengths:**")
+            for strength in analysis["key_strengths"]:
+                report_sections.append(f"  ✓ {strength}")
+
+            report_sections.append("\n**Key concerns:**")
+            for concern in analysis["key_concerns"]:
+                report_sections.append(f"  ⚠ {concern}")
+
+            report_sections.append("\n**Mechanistic reasoning:**")
+            report_sections.append(f"{analysis['mechanistic_reasoning']}\n")
+
+            report_sections.append("\n### Suggested experiments:\n")
+            for exp in plan.get("experiments", []):
+                report_sections.append(f"\n**Priority {exp['priority']}: {exp['experiment_type']}**")
+                report_sections.append(f"Design: {exp['design_summary']}")
+                report_sections.append(f"Addresses gap: {exp['addresses_gap']}")
                 report_sections.append(
-                    f"\n### Human Relevance Score: {analysis['human_relevance_score']:.1f}/100"
+                    f"Expected uncertainty reduction: {exp['expected_uncertainty_reduction']}%"
                 )
-                report_sections.append(f"Confidence: {analysis['confidence']}\n")
+                report_sections.append(
+                    f"Cost: {exp['estimated_cost']}, Duration: {exp['estimated_duration']}\n"
+                )
 
-                report_sections.append(f"\n**Bottom Line:** {analysis['bottom_line']}\n")
+            report_sections.append("\n" + "-" * 80 + "\n")
 
-                report_sections.append("\n**Сильные стороны:**")
-                for strength in analysis['key_strengths']:
-                    report_sections.append(f"  ✓ {strength}")
+    state["final_report"] = "\n".join(report_sections)
+    state["messages"] = ["Report generated."]
+    return state
 
-                report_sections.append("\n**Риски и ограничения:**")
-                for concern in analysis['key_concerns']:
-                    report_sections.append(f"  ⚠ {concern}")
 
-                report_sections.append(f"\n**Механистическое обоснование:**")
-                report_sections.append(f"{analysis['mechanistic_reasoning']}\n")
+# ================= PUBLIC BUILDER =================
 
-                report_sections.append("\n### Предлагаемые эксперименты:\n")
-                for exp in plan.get("experiments", []):
-                    report_sections.append(
-                        f"\n**Приоритет {exp['priority']}: {exp['experiment_type']}**"
-                    )
-                    report_sections.append(f"Дизайн: {exp['design_summary']}")
-                    report_sections.append(f"Закрывает пробел: {exp['addresses_gap']}")
-                    report_sections.append(
-                        f"Снижение неопределенности: {exp['expected_uncertainty_reduction']}%"
-                    )
-                    report_sections.append(
-                        f"Стоимость: {exp['estimated_cost']}, Срок: {exp['estimated_duration']}\n"
-                    )
 
-                report_sections.append("\n" + "-" * 80 + "\n")
+def build_agent_workflow(world_model_path: str, llm_model: str = "gpt-4o-mini", temperature: float = 0.0):
+    """Create the LangGraph workflow and supporting context."""
 
-        state["final_report"] = "\n".join(report_sections)
-        state["messages"] = [
-            "✓ Отчет сгенерирован"
-        ]
+    world_model = WorldModel(world_model_path)
+    llm = ChatOpenAI(model=llm_model, temperature=temperature)
 
-        return state
+    workflow = StateGraph(AgentState)
 
-    # ============ PUBLIC API ============
+    workflow.add_node("extract_intent", partial(_extract_intent_node, llm=llm))
+    workflow.add_node("query_world_model", partial(_query_world_model_node, world_model=world_model))
+    workflow.add_node("micro_reasoning_step", partial(_micro_reasoning_node, llm=llm))
+    workflow.add_node("translator_agent", partial(_translator_agent_node, llm=llm))
+    workflow.add_node("planner_agent", partial(_planner_agent_node, llm=llm))
+    workflow.add_node("generate_report", _generate_report_node)
 
-    def process_query(self, query: str) -> Dict[str, Any]:
-        """Обрабатывает пользовательский запрос"""
-        initial_state: AgentState = {
-            "user_query": query,
-            "messages": []
-        }
+    workflow.set_entry_point("extract_intent")
 
-        result = self.app.invoke(initial_state)
+    workflow.add_conditional_edges(
+        "extract_intent", _route_after_intent, {"query_wm": "query_world_model", "end": END}
+    )
+
+    workflow.add_edge("query_world_model", "micro_reasoning_step")
+    workflow.add_edge("micro_reasoning_step", "translator_agent")
+    workflow.add_edge("translator_agent", "planner_agent")
+    workflow.add_edge("planner_agent", "generate_report")
+    workflow.add_edge("generate_report", END)
+
+    return workflow.compile()
+
+
+def create_agent_runner(world_model_path: str = "ontology.yaml", llm_model: str = "gpt-4o-mini", temperature: float = 0.0):
+    """Return a callable that runs the full pipeline for a single query."""
+
+    app = build_agent_workflow(world_model_path, llm_model=llm_model, temperature=temperature)
+
+    def run(query: str) -> Dict[str, Any]:
+        initial_state: AgentState = {"user_query": query, "messages": []}
+        result = app.invoke(initial_state)
 
         return {
-            "report": result.get("final_report", "Отчет не сгенерирован"),
+            "report": result.get("final_report", "Report was not generated."),
             "intent": result.get("intent"),
             "entities": result.get("extracted_entities"),
             "analyses": result.get("translation_analysis", {}).get("analyses", []),
@@ -572,37 +533,29 @@ class LongevityAgentSystem:
             "errors": result.get("errors", []),
         }
 
+    return run
 
-# ============ ПРИМЕР ИСПОЛЬЗОВАНИЯ ============
 
 if __name__ == "__main__":
-    agent_system = LongevityAgentSystem(
-        world_model_path="onthology.yaml",
-        llm_model="gpt-4o-mini",  # или "gpt-4o-mini" для тестирования
-        temperature=0.0
-    )
+    run_agent = create_agent_runner(world_model_path="ontology.yaml", llm_model="gpt-4o-mini", temperature=0.0)
 
-    queries = [
-        "Проанализируй рапамицин как потенциальную интервенцию для продления жизни человека",
-        "Сравни метформин и калорийную рестрикцию по эффективности",
-        "Какие эксперименты нужны для валидации сенолитиков?",
+    sample_queries = [
+        "Analyze rapamycin as a candidate to extend human healthspan.",
+        "Compare metformin and caloric restriction for translational potential.",
+        "What experiments would validate senolytics for humans?",
     ]
 
-    for query in queries:
-        print(f"\n{'=' * 80}")
-        print(f"ЗАПРОС: {query}")
-        print(f"{'=' * 80}\n")
+    for query in sample_queries:
+        print("\n" + "=" * 80)
+        print(f"QUERY: {query}")
+        print("=" * 80 + "\n")
 
-        result = agent_system.process_query(query)
-
-        print("ЛОГИ:")
-        for log in result["logs"]:
-            print(f"  {log}")
+        result = run_agent(query)
 
         if result["errors"]:
-            print("\nОШИБКИ:")
+            print("Errors:")
             for error in result["errors"]:
-                print(f"  ❌ {error}")
+                print(f"  - {error}")
 
-        print("\n" + result["report"])
+        print(result["report"])
         print("\n")

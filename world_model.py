@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Any, Set
+from typing import Any, Dict, List, Optional, Set
+
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 
 
-# ---------- СУЩНОСТИ ОНТОЛОГИИ ----------
+# ---------- ONTOLOGY ENTITIES ----------
 
 class Species(BaseModel):
     id: str
@@ -29,7 +30,7 @@ class Gene(BaseModel):
 class InterventionEffect(BaseModel):
     species: str
     lifespan_change_pct: float
-    evidence_level: str  # можно позже сузить до Literal["strong","medium","mixed","weak"]
+    evidence_level: str  # can be tightened later to Literal["strong","medium","mixed","weak"]
 
 
 class Intervention(BaseModel):
@@ -40,7 +41,7 @@ class Intervention(BaseModel):
     effects: List[InterventionEffect] = Field(default_factory=list)
 
 
-# ---------- ШАГИ ВЫВОДА (TRACE) ----------
+# ---------- INFERENCE TRACE STEPS ----------
 
 class InferenceStep(BaseModel):
     rule_name: str
@@ -50,7 +51,7 @@ class InferenceStep(BaseModel):
     preconditions: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ---------- МИР ----------
+# ---------- WORLD MODEL ----------
 
 class WorldModel:
     def __init__(self, yaml_path: str):
@@ -78,10 +79,10 @@ class WorldModel:
             ) or {}
 
         except ValidationError as e:
-            # Это удобно, потому что сразу увидишь, где YAML сломан
-            raise RuntimeError(f"Ошибка валидации онтологии: {e}") from e
+            # Fail fast when ontology content is malformed
+            raise RuntimeError(f"Ontology validation error: {e}") from e
 
-    # ---------- ГЕТТЕРЫ / ПОИСК ----------
+    # ---------- ACCESSORS / LOOKUPS ----------
 
     def get_intervention(self, intervention_id: str) -> Optional[Intervention]:
         return self.interventions.get(intervention_id)
@@ -93,32 +94,24 @@ class WorldModel:
                 return iv
         return None
 
-    # ---------- ЛОГИКА ОЦЕНКИ ----------
+    # ---------- TRANSLATION SCORING LOGIC ----------
 
     def compute_translation_score(self, intervention_id: str) -> Dict[str, Any]:
-        """
-        Возвращает dict:
-        {
-          "intervention": {...},
-          "score": float,
-          "steps": [InferenceStep-as-dict, ...],
-          "warnings": [str, ...],
-        }
-        """
+        """Return a structured scoring result for an intervention."""
         iv = self.get_intervention(intervention_id)
         if iv is None:
             return {
                 "intervention": None,
                 "score": 0.0,
                 "steps": [],
-                "warnings": [f"Интервенция '{intervention_id}' не найдена в World Model."],
+                "warnings": [f"Intervention '{intervention_id}' is missing from the World Model."],
             }
 
         rules = self.scoring_rules
         score = float(rules.get("base", 0.0))
         steps: List[InferenceStep] = []
 
-        # --- R1: multi-species сигнал ---
+        # --- R1: multi-species signal ---
         species_set: Set[str] = {eff.species for eff in iv.effects}
         n_species = len(species_set)
         multi_bonus = float(rules.get("multi_species_bonus", 2.0))
@@ -129,7 +122,7 @@ class WorldModel:
                     rule_name="multi_species_bonus",
                     applied=True,
                     delta=multi_bonus,
-                    explanation=f"Эффект показан у нескольких видов ({', '.join(sorted(species_set))}).",
+                    explanation=f"Effect reproduced across species ({', '.join(sorted(species_set))}).",
                     preconditions={"n_species": n_species},
                 )
             )
@@ -139,12 +132,12 @@ class WorldModel:
                     rule_name="multi_species_bonus",
                     applied=False,
                     delta=0.0,
-                    explanation="Эффект показан только у одного вида.",
+                    explanation="Effect observed in a single species only.",
                     preconditions={"n_species": n_species},
                 )
             )
 
-        # --- R2: консервативные пути через таргеты ---
+        # --- R2: conserved pathways hit by targets ---
         conserved_bonus = float(rules.get("conserved_pathway_bonus", 2.0))
         conserved_hit = False
         conserved_paths: List[str] = []
@@ -167,7 +160,7 @@ class WorldModel:
                     applied=True,
                     delta=conserved_bonus,
                     explanation=(
-                        "Интервенция таргетирует консервативные между мышью и человеком пути: "
+                        "Targets hit pathways conserved between mouse and human: "
                         + ", ".join(sorted(set(conserved_paths)))
                     ),
                     preconditions={"conserved_paths": conserved_paths},
@@ -179,12 +172,12 @@ class WorldModel:
                     rule_name="conserved_pathway_bonus",
                     applied=False,
                     delta=0.0,
-                    explanation="Не обнаружено консервативных между мышью и человеком путей среди таргетов.",
+                    explanation="No conserved mouse-human pathways were found among the targets.",
                     preconditions={},
                 )
             )
 
-        # --- R3: human longevity evidence по таргетам ---
+        # --- R3: human longevity evidence on targets ---
         human_bonus = float(rules.get("human_longevity_gene_bonus", 2.0))
         human_ev_targets: List[str] = []
         for g_id in iv.targets:
@@ -203,7 +196,7 @@ class WorldModel:
                     applied=True,
                     delta=human_bonus,
                     explanation=(
-                        "Среди таргетов есть гены с evidence по человеческому долголетию: "
+                        "Targets include genes with human longevity evidence: "
                         + ", ".join(human_ev_targets)
                     ),
                     preconditions={"targets_with_human_evidence": human_ev_targets},
@@ -215,12 +208,12 @@ class WorldModel:
                     rule_name="human_longevity_gene_bonus",
                     applied=False,
                     delta=0.0,
-                    explanation="Нет прямых таргетов с evidence по человеческому долголетию.",
+                    explanation="No direct human longevity evidence among targets.",
                     preconditions={},
                 )
             )
 
-        # --- R4: штраф за weak/mixed evidence ---
+        # --- R4: penalty for weak/mixed evidence ---
         weak_penalty = float(rules.get("weak_evidence_penalty", -1.0))
         weak_cases: List[str] = []
         evidence_levels = set()
@@ -239,8 +232,7 @@ class WorldModel:
                     applied=True,
                     delta=weak_penalty * len(weak_cases),
                     explanation=(
-                        "Есть слабый/смешанный evidence по видам: "
-                        + ", ".join(weak_cases)
+                        "Weak or mixed evidence reported for: " + ", ".join(weak_cases)
                     ),
                     preconditions={"weak_cases": weak_cases},
                 )
@@ -251,12 +243,11 @@ class WorldModel:
                     rule_name="weak_evidence_penalty",
                     applied=False,
                     delta=0.0,
-                    explanation="Слабого или смешанного evidence не обнаружено.",
+                    explanation="No weak or mixed evidence detected.",
                     preconditions={},
                 )
             )
 
-        # --- валидация вывода ---
         warnings = self.validate_inference(iv, score, steps, evidence_levels, species_set)
 
         return {
@@ -270,7 +261,7 @@ class WorldModel:
             "warnings": warnings,
         }
 
-    # ---------- МИНИ-ВАЛИДАТОР ----------
+    # ---------- MINI VALIDATOR ----------
 
     def validate_inference(
         self,
@@ -282,32 +273,25 @@ class WorldModel:
     ) -> List[str]:
         warnings: List[str] = []
 
-        # Было ли human longevity evidence использовано?
         has_human_ev = any(
             s.rule_name == "human_longevity_gene_bonus" and s.applied for s in steps
         )
 
         only_invertebrates = species_set.issubset({"fly", "worm"})
 
-        # 1) высокий score без human evidence
         if score >= 4.0 and not has_human_ev:
             warnings.append(
-                "Высокий интегральный score при отсутствии прямого evidence по человеку. "
-                "Интерпретировать результат с осторожностью."
+                "High composite score despite missing direct human evidence. Interpret with caution."
             )
 
-        # 2) эффект только у беспозвоночных, но score высокий
         if score >= 3.0 and only_invertebrates:
             warnings.append(
-                "Эффекты показаны только у беспозвоночных моделей (fly/worm). "
-                "Риск низкой транслируемости на млекопитающих."
+                "Evidence exists only in invertebrates (fly/worm). Mammalian translation risk is high."
             )
 
-        # 3) гетерогенный профиль evidence
         if "strong" in evidence_levels and ("weak" in evidence_levels or "mixed" in evidence_levels):
             warnings.append(
-                "Наблюдается гетерогенный профиль evidence (сильные и слабые/смешанные данные по разным видам). "
-                "Возможна контекст-зависимая эффективность."
+                "Heterogeneous evidence profile detected (both strong and weak/mixed signals). Context dependence likely."
             )
 
         return warnings
