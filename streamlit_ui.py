@@ -1,5 +1,3 @@
-"""Simple Streamlit UI for the longevity agent PoC."""
-
 import os
 from typing import Any, Dict, List
 
@@ -87,7 +85,7 @@ def _render_world_model_snapshot(world_model: WorldModel, interventions: List[st
 
 def main():
     st.title("🧬 Longevity Agent PoC")
-    st.caption("Minimal interactive demo that wires the world model into a multi-agent reasoning pipeline.")
+    st.caption("Minimal interactive demo")
 
     resources = init_agent()
     runner = resources["runner"]

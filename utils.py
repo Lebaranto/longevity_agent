@@ -1,5 +1,3 @@
-"""Utility helpers for the longevity agent PoC."""
-
 from __future__ import annotations
 
 import csv
