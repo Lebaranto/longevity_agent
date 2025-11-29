@@ -1,0 +1,9 @@
+pydantic
+PyYAML
+langchain-core
+langgraph
+langchain-openai
+python-dotenv
+typing_extensions
+streamlit
+openai
